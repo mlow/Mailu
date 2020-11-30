@@ -5,6 +5,7 @@ from passlib import context, hash
 from datetime import datetime, date
 from email.mime import text
 from flask import current_app as app
+from textwrap import wrap
 
 import flask_sqlalchemy
 import sqlalchemy
@@ -15,6 +16,8 @@ import glob
 import smtplib
 import idna
 import dns
+import json
+import itertools
 
 
 db = flask_sqlalchemy.SQLAlchemy()
@@ -32,6 +35,7 @@ class IdnaDomain(db.TypeDecorator):
     def process_result_value(self, value, dialect):
         return idna.decode(value)
 
+    python_type = str
 
 class IdnaEmail(db.TypeDecorator):
     """ Stores a Unicode string in it's IDNA representation (ASCII only)
@@ -56,6 +60,7 @@ class IdnaEmail(db.TypeDecorator):
             idna.decode(domain_name),
         )
 
+    python_type = str
 
 class CommaSeparatedList(db.TypeDecorator):
     """ Stores a list as a comma-separated string, compatible with Postfix.
@@ -64,19 +69,20 @@ class CommaSeparatedList(db.TypeDecorator):
     impl = db.String
 
     def process_bind_param(self, value, dialect):
-        if type(value) is not list:
-            raise TypeError("Shoud be a list")
+        if not isinstance(value, (list, set)):
+            raise TypeError("Should be a list")
         for item in value:
             if "," in item:
-                raise ValueError("No item should contain a comma")
-        return ",".join(value)
+                raise ValueError("Item must not contain a comma")
+        return ",".join(sorted(value))
 
     def process_result_value(self, value, dialect):
         return list(filter(bool, value.split(","))) if value else []
 
+    python_type = list
 
 class JSONEncoded(db.TypeDecorator):
-    """Represents an immutable structure as a json-encoded string.
+    """ Represents an immutable structure as a json-encoded string.
     """
 
     impl = db.String
@@ -87,6 +93,7 @@ class JSONEncoded(db.TypeDecorator):
     def process_result_value(self, value, dialect):
         return json.loads(value) if value else None
 
+    python_type = str
 
 class Base(db.Model):
     """ Base class for all models
@@ -104,6 +111,247 @@ class Base(db.Model):
     created_at = db.Column(db.Date, nullable=False, default=date.today)
     updated_at = db.Column(db.Date, nullable=True, onupdate=date.today)
     comment = db.Column(db.String(255), nullable=True)
+
+    @classmethod
+    def _dict_pkey(model):
+        return model.__mapper__.primary_key[0].name
+
+    def _dict_pval(self):
+        return getattr(self, self._dict_pkey())
+
+    def to_dict(self, full=False, include_secrets=False, include_extra=None, recursed=False, hide=None):
+        """ Return a dictionary representation of this model.
+        """
+
+        if recursed and not getattr(self, '_dict_recurse', False):
+            return str(self)
+
+        hide = set(hide or []) | {'created_at', 'updated_at'}
+        if hasattr(self, '_dict_hide'):
+            hide |= self._dict_hide
+
+        secret = set()
+        if not include_secrets and hasattr(self, '_dict_secret'):
+            secret |= self._dict_secret
+
+        convert = getattr(self, '_dict_output', {})
+
+        extra_keys = getattr(self, '_dict_extra', {})
+        if include_extra is None:
+            include_extra = []
+
+        res = {}
+
+        for key in itertools.chain(
+            self.__table__.columns.keys(),
+            getattr(self, '_dict_show', []),
+            *[extra_keys.get(extra, []) for extra in include_extra]
+        ):
+            if key in hide:
+                continue
+            if key in self.__table__.columns:
+                default = self.__table__.columns[key].default
+                if isinstance(default, sqlalchemy.sql.schema.ColumnDefault):
+                    default = default.arg
+            else:
+                default = None
+            value = getattr(self, key)
+            if full or ((default or value) and value != default):
+                if key in secret:
+                    value = '<hidden>'
+                elif value is not None and key in convert:
+                    value = convert[key](value)
+                res[key] = value
+
+        for key in self.__mapper__.relationships.keys():
+            if key in hide:
+                continue
+            if self.__mapper__.relationships[key].uselist:
+                items = getattr(self, key)
+                if self.__mapper__.relationships[key].query_class is not None:
+                    if hasattr(items, 'all'):
+                        items = items.all()
+                if full or len(items):
+                    if key in secret:
+                        res[key] = '<hidden>'
+                    else:
+                        res[key] = [item.to_dict(full, include_secrets, include_extra, True) for item in items]
+            else:
+                value = getattr(self, key)
+                if full or value is not None:
+                    if key in secret:
+                        res[key] = '<hidden>'
+                    else:
+                        res[key] = value.to_dict(full, include_secrets, include_extra, True)
+
+        return res
+
+    @classmethod
+    def from_dict(model, data, delete=False):
+
+        changed = []
+
+        pkey = model._dict_pkey()
+
+        # handle "primary key" only
+        if type(data) is not dict:
+            data = {pkey: data}
+
+        # modify input data
+        if hasattr(model, '_dict_input'):
+            try:
+                model._dict_input(data)
+            except Exception as reason:
+                raise ValueError(f'{reason}', model, None, data)
+
+        # check for primary key (if not recursed)
+        if not getattr(model, '_dict_recurse', False):
+            if not pkey in data:
+                raise KeyError(f'primary key {model.__table__}.{pkey} is missing', model, pkey, data)
+
+        # check data keys and values
+        for key in list(data.keys()):
+
+            # check key
+            if not hasattr(model, key) and not key in model.__mapper__.relationships:
+                raise KeyError(f'unknown key {model.__table__}.{key}', model, key, data)
+
+            # check value type
+            value = data[key]
+            col = model.__mapper__.columns.get(key)
+            if col is not None:
+                if not ((value is None and col.nullable) or (type(value) is col.type.python_type)):
+                    raise TypeError(f'{model.__table__}.{key} {value!r} has invalid type {type(value).__name__!r}', model, key, data)
+            else:
+                rel = model.__mapper__.relationships.get(key)
+                if rel is None:
+                    itype = getattr(model, '_dict_types', {}).get(key)
+                    if itype is not None:
+                        if itype is False: # ignore value
+                            del data[key]
+                            continue
+                        elif not isinstance(value, itype):
+                            raise TypeError(f'{model.__table__}.{key} {value!r} has invalid type {type(value).__name__!r}', model, key, data)
+                    else:
+                        raise NotImplementedError(f'type not defined for {model.__table__}.{key}')
+
+            # handle relationships
+            if key in model.__mapper__.relationships:
+                rel_model = model.__mapper__.relationships[key].argument
+                if not isinstance(rel_model, sqlalchemy.orm.Mapper):
+                    add = rel_model.from_dict(value, delete)
+                    assert len(add) == 1
+                    rel_item, updated = add[0]
+                    changed.append((rel_item, updated))
+                    data[key] = rel_item
+
+        # create item if necessary
+        created = False
+        item = model.query.get(data[pkey]) if pkey in data else None
+        if item is None:
+
+            # check for mandatory keys
+            missing = getattr(model, '_dict_mandatory', set()) - set(data.keys())
+            if missing:
+                raise ValueError(f'mandatory key(s) {", ".join(sorted(missing))} for {model.__table__} missing', model, missing, data)
+
+            # remove mapped relationships from data
+            mapped = {}
+            for key in list(data.keys()):
+                if key in model.__mapper__.relationships:
+                    if isinstance(model.__mapper__.relationships[key].argument, sqlalchemy.orm.Mapper):
+                        mapped[key] = data[key]
+                        del data[key]
+
+            # create new item
+            item = model(**data)
+            created = True
+
+            # and update mapped relationships (below)
+            data = mapped
+
+        # update item
+        updated = []
+        for key, value in data.items():
+
+            # skip primary key
+            if key == pkey:
+                continue
+
+            if key in model.__mapper__.relationships:
+                # update relationship
+                rel_model = model.__mapper__.relationships[key].argument
+                if isinstance(rel_model, sqlalchemy.orm.Mapper):
+                    rel_model = rel_model.class_
+                    # add (and create) referenced items
+                    cur = getattr(item, key)
+                    old = sorted(cur, key=lambda i:id(i))
+                    new = []
+                    for rel_data in value:
+                        # get or create related item
+                        add = rel_model.from_dict(rel_data, delete)
+                        assert len(add) == 1
+                        rel_item, rel_updated = add[0]
+                        changed.append((rel_item, rel_updated))
+                        if rel_item not in cur:
+                            cur.append(rel_item)
+                        new.append(rel_item)
+
+                    # delete referenced items missing in yaml
+                    rel_pkey = rel_model._dict_pkey()
+                    new_data = list([i.to_dict(True, True, None, True, [rel_pkey]) for i in new])
+                    for rel_item in old:
+                        if rel_item not in new:
+                            # check if item with same data exists to stabilze import without primary key
+                            rel_data = rel_item.to_dict(True, True, None, True, [rel_pkey])
+                            try:
+                                same_idx = new_data.index(rel_data)
+                            except ValueError:
+                                same = None
+                            else:
+                                same = new[same_idx]
+
+                            if same is None:
+                                # delete items missing in new
+                                if delete:
+                                    cur.remove(rel_item)
+                                else:
+                                    new.append(rel_item)
+                            else:
+                                # swap found item with same data with newly created item
+                                new.append(rel_item)
+                                new_data.append(rel_data)
+                                new.remove(same)
+                                del new_data[same_idx]
+                                for i, (ch_item, ch_update) in enumerate(changed):
+                                    if ch_item is same:
+                                        changed[i] = (rel_item, [])
+                                        db.session.flush()
+                                        db.session.delete(ch_item)
+                                        break
+
+                    # remember changes
+                    new = sorted(new, key=lambda i:id(i))
+                    if new != old:
+                        updated.append((key, old, new))
+
+            else:
+                # update key
+                old = getattr(item, key)
+                if type(old) is list:
+                    # deduplicate list value
+                    assert type(value) is list
+                    value = set(value)
+                    old = set(old)
+                    if not delete:
+                        value = old | value
+                if value != old:
+                    updated.append((key, old, value))
+                    setattr(item, key, value)
+
+        changed.append((item, created if created else updated))
+
+        return changed
 
 
 # Many-to-many association table for domain managers
@@ -126,6 +374,48 @@ class Domain(Base):
     """
     __tablename__ = "domain"
 
+    _dict_hide = {'users', 'managers', 'aliases'}
+    _dict_show = {'dkim_key'}
+    _dict_extra = {'dns':{'dkim_publickey', 'dns_mx', 'dns_spf', 'dns_dkim', 'dns_dmarc'}}
+    _dict_secret = {'dkim_key'}
+    _dict_types = {
+        'dkim_key': (bytes, type(None)),
+        'dkim_publickey': False,
+        'dns_mx': False,
+        'dns_spf': False,
+        'dns_dkim': False,
+        'dns_dmarc': False,
+    }
+    _dict_output = {'dkim_key': lambda key: key.decode('utf-8').strip().split('\n')[1:-1]}
+    @staticmethod
+    def _dict_input(data):
+        if 'dkim_key' in data:
+            key = data['dkim_key']
+            if key is not None:
+                if type(key) is list:
+                    key = ''.join(key)
+                if type(key) is str:
+                    key = ''.join(key.strip().split()) # removes all whitespace
+                    if key == 'generate':
+                        data['dkim_key'] = dkim.gen_key()
+                    elif key:
+                        m = re.match('^-----BEGIN (RSA )?PRIVATE KEY-----', key)
+                        if m is not None:
+                            key = key[m.end():]
+                        m = re.search('-----END (RSA )?PRIVATE KEY-----$', key)
+                        if m is not None:
+                            key = key[:m.start()]
+                        key = '\n'.join(wrap(key, 64))
+                        key = f'-----BEGIN PRIVATE KEY-----\n{key}\n-----END PRIVATE KEY-----\n'.encode('ascii')
+                        try:
+                            dkim.strip_key(key)
+                        except:
+                            raise ValueError('invalid dkim key')
+                        else:
+                          data['dkim_key'] = key
+                    else:
+                        data['dkim_key'] = None
+
     name = db.Column(IdnaDomain, primary_key=True, nullable=False)
     managers = db.relationship('User', secondary=managers,
         backref=db.backref('manager_of'), lazy='dynamic')
@@ -134,20 +424,52 @@ class Domain(Base):
     max_quota_bytes = db.Column(db.BigInteger(), nullable=False, default=0)
     signup_enabled = db.Column(db.Boolean(), nullable=False, default=False)
 
+    def _dkim_file(self):
+        return app.config["DKIM_PATH"].format(
+            domain=self.name, selector=app.config["DKIM_SELECTOR"])
+
+    @property
+    def dns_mx(self):
+        hostname = app.config['HOSTNAMES'].split(',')[0]
+        return f'{self.name}. 600 IN MX 10 {hostname}.'
+    
+    @property
+    def dns_spf(self):
+        hostname = app.config['HOSTNAMES'].split(',')[0]
+        return f'{self.name}. 600 IN TXT "v=spf1 mx a:{hostname} ~all"'
+    
+    @property
+    def dns_dkim(self):
+        if os.path.exists(self._dkim_file()):
+            selector = app.config['DKIM_SELECTOR']
+            return f'{selector}._domainkey.{self.name}. 600 IN TXT "v=DKIM1; k=rsa; p={self.dkim_publickey}"'
+
+    @property
+    def dns_dmarc(self):
+        if os.path.exists(self._dkim_file()):
+            domain = app.config['DOMAIN']
+            rua = app.config['DMARC_RUA']
+            rua = f' rua=mailto:{rua}@{domain};' if rua else ''
+            ruf = app.config['DMARC_RUF']
+            ruf = f' ruf=mailto:{ruf}@{domain};' if ruf else ''
+            return f'_dmarc.{self.name}. 600 IN TXT "v=DMARC1; p=reject;{rua}{ruf} adkim=s; aspf=s"'
+    
     @property
     def dkim_key(self):
-        file_path = app.config["DKIM_PATH"].format(
-            domain=self.name, selector=app.config["DKIM_SELECTOR"])
+        file_path = self._dkim_file()
         if os.path.exists(file_path):
             with open(file_path, "rb") as handle:
                 return handle.read()
 
     @dkim_key.setter
     def dkim_key(self, value):
-        file_path = app.config["DKIM_PATH"].format(
-            domain=self.name, selector=app.config["DKIM_SELECTOR"])
-        with open(file_path, "wb") as handle:
-            handle.write(value)
+        file_path = self._dkim_file()
+        if value is None:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+        else:
+            with open(file_path, "wb") as handle:
+                handle.write(value)
 
     @property
     def dkim_publickey(self):
@@ -172,7 +494,7 @@ class Domain(Base):
                 str(rset).split()[-1][:-1] in hostnames
                 for rset in dns.resolver.query(self.name, 'MX')
             )
-        except Exception as e:
+        except Exception:
             return False
 
     def __str__(self):
@@ -208,6 +530,8 @@ class Relay(Base):
 
     __tablename__ = "relay"
 
+    _dict_mandatory = {'smtp'}
+
     name = db.Column(IdnaDomain, primary_key=True, nullable=False)
     smtp = db.Column(db.String(80), nullable=True)
 
@@ -220,6 +544,16 @@ class Email(object):
     """
 
     localpart = db.Column(db.String(80), nullable=False)
+
+    @staticmethod
+    def _dict_input(data):
+        if 'email' in data:
+            if 'localpart' in data or 'domain' in data:
+                raise ValueError('ambigous key email and localpart/domain')
+            elif type(data['email']) is str:
+                data['localpart'], data['domain'] = data['email'].rsplit('@', 1)
+        else:
+            data['email'] = f"{data['localpart']}@{data['domain']}"
 
     @declarative.declared_attr
     def domain_name(cls):
@@ -306,6 +640,30 @@ class User(Base, Email):
     """
     __tablename__ = "user"
 
+    _dict_hide = {'domain_name', 'domain', 'localpart', 'quota_bytes_used'}
+    _dict_mandatory = {'localpart', 'domain', 'password'}
+    @classmethod
+    def _dict_input(cls, data):
+        Email._dict_input(data)
+        # handle password
+        if 'password' in data:
+            if 'password_hash' in data or 'hash_scheme' in data:
+                raise ValueError('ambigous key password and password_hash/hash_scheme')
+            # check (hashed) password
+            password = data['password']
+            if password.startswith('{') and '}' in password:
+                scheme = password[1:password.index('}')]
+                if scheme not in cls.scheme_dict:
+                    raise ValueError(f'invalid password scheme {scheme!r}')
+            else:
+                raise ValueError(f'invalid hashed password {password!r}')
+        elif 'password_hash' in data and 'hash_scheme' in data:
+            if data['hash_scheme'] not in cls.scheme_dict:
+                raise ValueError(f'invalid password scheme {scheme!r}')
+            data['password'] = '{'+data['hash_scheme']+'}'+ data['password_hash']
+            del data['hash_scheme']
+            del data['password_hash']
+
     domain = db.relationship(Domain,
         backref=db.backref('users', cascade='all, delete-orphan'))
     password = db.Column(db.String(255), nullable=False)
@@ -346,10 +704,10 @@ class User(Base, Email):
     @property
     def destination(self):
         if self.forward_enabled:
-            result = self.forward_destination
+            result = list(self.forward_destination)
             if self.forward_keep:
-                result += ',' + self.email
-            return result
+                result.append(self.email)
+            return ','.join(result)
         else:
             return self.email
 
@@ -431,6 +789,15 @@ class Alias(Base, Email):
     """
     __tablename__ = "alias"
 
+    _dict_hide = {'domain_name', 'domain', 'localpart'}
+    @staticmethod
+    def _dict_input(data):
+        Email._dict_input(data)
+        # handle comma delimited string for backwards compability
+        dst = data.get('destination')
+        if type(dst) is str:
+            data['destination'] = list([adr.strip() for adr in dst.split(',')])
+
     domain = db.relationship(Domain,
         backref=db.backref('aliases', cascade='all, delete-orphan'))
     wildcard = db.Column(db.Boolean(), nullable=False, default=False)
@@ -484,6 +851,10 @@ class Token(Base):
     """
     __tablename__ = "token"
 
+    _dict_recurse = True
+    _dict_hide = {'user', 'user_email'}
+    _dict_mandatory = {'password'}
+
     id = db.Column(db.Integer(), primary_key=True)
     user_email = db.Column(db.String(255), db.ForeignKey(User.email),
         nullable=False)
@@ -499,14 +870,19 @@ class Token(Base):
         self.password = hash.sha256_crypt.using(rounds=1000).hash(password)
 
     def __str__(self):
-        return self.comment
+        return self.comment or self.ip
 
 
 class Fetch(Base):
-    """ A fetched account is a repote POP/IMAP account fetched into a local
+    """ A fetched account is a remote POP/IMAP account fetched into a local
     account.
     """
     __tablename__ = "fetch"
+
+    _dict_recurse = True
+    _dict_hide = {'user_email', 'user', 'last_check', 'error'}
+    _dict_mandatory = {'protocol', 'host', 'port', 'username', 'password'}
+    _dict_secret = {'password'}
 
     id = db.Column(db.Integer(), primary_key=True)
     user_email = db.Column(db.String(255), db.ForeignKey(User.email),
@@ -516,9 +892,12 @@ class Fetch(Base):
     protocol = db.Column(db.Enum('imap', 'pop3'), nullable=False)
     host = db.Column(db.String(255), nullable=False)
     port = db.Column(db.Integer(), nullable=False)
-    tls = db.Column(db.Boolean(), nullable=False)
+    tls = db.Column(db.Boolean(), nullable=False, default=False)
     username = db.Column(db.String(255), nullable=False)
     password = db.Column(db.String(255), nullable=False)
-    keep = db.Column(db.Boolean(), nullable=False)
+    keep = db.Column(db.Boolean(), nullable=False, default=False)
     last_check = db.Column(db.DateTime, nullable=True)
     error = db.Column(db.String(1023), nullable=True)
+
+    def __str__(self):
+        return f'{self.protocol}{"s" if self.tls else ""}://{self.username}@{self.host}:{self.port}'
